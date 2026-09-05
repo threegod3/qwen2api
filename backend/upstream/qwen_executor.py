@@ -1,0 +1,358 @@
+import asyncio
+import json
+import logging
+import time
+
+from backend.core.config import settings
+from backend.core.request_logging import update_request_context
+from backend.services.auth_resolver import AuthResolver
+from backend.upstream.payload_builder import build_chat_payload
+from backend.upstream.sse_consumer import parse_sse_chunk
+
+log = logging.getLogger("qwen2api.executor")
+
+
+class QwenExecutor:
+    def __init__(self, engine, account_pool):
+        self.engine = engine
+        self.account_pool = account_pool
+        self.auth_resolver = AuthResolver(account_pool) if account_pool is not None else None
+        # 会在 app 启动时被 main.py 注入；若未注入则为 None，走同步 create_chat
+        self.chat_id_pool = None
+
+    async def create_chat(self, token: str, model: str, chat_type: str = "t2t") -> str:
+        # 预热池只用于普通文本会话；t2v/t2i 等必须新建对应 chat_type
+        if chat_type == "t2t" and self.chat_id_pool is not None and self.account_pool is not None:
+            try:
+                acc = next((a for a in self.account_pool.accounts if a.token == token), None)
+                if acc is not None:
+                    cached = await self.chat_id_pool.acquire(acc.email, model)
+                    if cached:
+                        log.info(f"[上游] 预热池命中 邮箱={acc.email} 会话={cached}")
+                        return cached
+            except Exception as e:
+                log.debug(f"[Executor] chat_id_pool lookup failed: {e}")
+
+        request_fn = getattr(self.engine, "_request_json", None) or getattr(self.engine, "api_call", None)
+        if request_fn is None:
+            raise Exception("request transport unavailable")
+
+        ts = int(time.time())
+        body = {
+            "title": f"api_{ts}",
+            "models": [model],
+            "chat_mode": "normal",
+            "chat_type": chat_type,
+            "timestamp": ts,
+        }
+
+        if getattr(self.engine, "_request_json", None) is not None:
+            r = await request_fn("POST", "/api/v2/chats/new", token, body, timeout=30.0)
+        else:
+            r = await request_fn("POST", "/api/v2/chats/new", token, body)
+        body_text = r.get("body", "")
+        if r["status"] != 200:
+            body_lower = body_text.lower()
+            if (
+                r["status"] in (401, 403)
+                or "unauthorized" in body_lower
+                or "forbidden" in body_lower
+                or "token" in body_lower
+                or "login" in body_lower
+                or "401" in body_text
+                or "403" in body_text
+            ):
+                raise Exception(f"unauthorized: create_chat HTTP {r['status']}: {body_text[:100]}")
+            if r["status"] == 429:
+                raise Exception("429 Too Many Requests")
+            raise Exception(f"create_chat HTTP {r['status']}: {body_text[:100]}")
+
+        # 检测 WAF 拦截（非账号问题）
+        if "aliyun_waf" in body_text.lower() or "captcha" in body_text.lower() or "<!doctype" in body_text[:50].lower():
+            raise Exception(f"waf_blocked: WAF 拦截 (create_chat): {body_text[:200]}")
+
+        try:
+            data = json.loads(body_text)
+            if not data.get("success") or "id" not in data.get("data", {}):
+                raise Exception("Qwen API returned error or missing id")
+            return data["data"]["id"]
+        except Exception as e:
+            body_lower = body_text.lower()
+            if any(
+                kw in body_lower
+                for kw in (
+                    "login",
+                    "unauthorized",
+                    "activation",
+                    "pending",
+                    "forbidden",
+                    "token",
+                    "expired",
+                    "invalid",
+                )
+            ) and "waf" not in body_lower and "html" not in body_lower:
+                raise Exception(f"unauthorized: account issue: {body_text[:200]}")
+            raise Exception(f"create_chat parse error: {e}, body={body_text[:200]}")
+
+    async def stream(
+        self,
+        token: str,
+        chat_id: str,
+        model: str,
+        content: str,
+        has_custom_tools: bool = False,
+        files: list[dict] | None = None,
+    ):
+        stream_fn = getattr(self.engine, "stream_chat_once", None) or getattr(self.engine, "fetch_chat", None)
+        if stream_fn is None:
+            raise Exception("stream transport unavailable")
+
+        payload = build_chat_payload(chat_id, model, content, has_custom_tools, files=files)
+        buffer = ""
+        started_at = time.perf_counter()
+        first_event_logged = False
+        last_chunk_time = time.perf_counter()
+        total_output_chars = 0  # 方案4：统计输出字符数
+
+        feature_config = payload.get("messages", [{}])[0].get("feature_config", {})
+        prompt_len = len(content)
+        log.info(f"[上游] 开始流式 会话={chat_id} 模型={model} 自定义工具={has_custom_tools} prompt长度={prompt_len} ({prompt_len/1024:.1f}KB)")
+        log.info(f"[上游] 功能配置: function_calling={feature_config.get('function_calling')} auto_search={feature_config.get('auto_search')} code_interpreter={feature_config.get('code_interpreter')} plugins_enabled={feature_config.get('plugins_enabled')}")
+
+        prompt_content = payload.get("messages", [{}])[0].get("content", "")
+        if "##TOOL_CALL##" in prompt_content:
+            log.info(f"[上游] prompt 包含 ##TOOL_CALL## 标记（正常）")
+        else:
+            log.warning(f"[上游] prompt 缺少 ##TOOL_CALL## 标记 — 可能导致上游拦截")
+        log.info(f"[上游] prompt 前 500 字预览: {prompt_content[:500]}")
+
+        try:
+            async for chunk_result in stream_fn(token, chat_id, payload):
+                last_chunk_time = time.perf_counter()
+
+                if chunk_result.get("status") not in (None, 200, "streamed"):
+                    body = chunk_result.get("body", b"")
+                    if isinstance(body, bytes):
+                        body = body.decode("utf-8", errors="ignore")
+                    raise Exception(f"HTTP {chunk_result['status']}: {str(body)[:100]}")
+
+                if "chunk" in chunk_result:
+                    raw_chunk = chunk_result["chunk"]
+                    buffer += raw_chunk
+                    total_output_chars += len(raw_chunk)
+                    # BaXia punish 跳转页会以"正常 chunk"的形式流进来，但解析成
+                    # SSE 得到 0 个事件，最终被误报成 empty_upstream_response。
+                    # 这里在字节层面兜一道，转成明确的 WAF 异常交给重试逻辑处理。
+                    if not first_event_logged and (
+                        "_____tmd_____/punish" in raw_chunk
+                        or ("x5secdata=" in raw_chunk and "x5step=" in raw_chunk)
+                    ):
+                        log.warning("[上游] 检测到 punish 挑战页（伪装成 SSE 数据）会话=%s", chat_id)
+                        raise Exception(f"WAF challenge (punish): {raw_chunk[:200]}")
+                    # 预热池里的 chat_id 可能已被上游回收，此时返回 CHAT_NOT_FOUND
+                    # 的 JSON（同样解析出 0 个 SSE 事件 → 误报空输出）。
+                    # 抛成可识别异常，让重试层作废这个 chat_id 后换新会话重来。
+                    if not first_event_logged and "CHAT_NOT_FOUND" in raw_chunk:
+                        log.warning("[上游] 会话已失效 CHAT_NOT_FOUND 会话=%s", chat_id)
+                        raise Exception(f"chat_not_found: {raw_chunk[:200]}")
+                    # DEBUG: 记录上游原始 SSE 数据前 500 字节
+                    if total_output_chars < 5000:
+                        log.info("[上游-DEBUG] 原始 SSE 数据块: %s", raw_chunk[:500])
+                    while "\n\n" in buffer:
+                        msg, buffer = buffer.split("\n\n", 1)
+                        log.info("[上游-DEBUG] 解析 SSE 消息: %s", msg[:500])
+                        for evt in parse_sse_chunk(msg):
+                            if not first_event_logged:
+                                first_event_logged = True
+                                log.info(
+                                    f"[上游] 首个事件耗时 {(time.perf_counter() - started_at):.3f}s 会话={chat_id}"
+                                )
+                            yield evt
+        except Exception as e:
+            elapsed = time.perf_counter() - started_at
+            idle_time = time.perf_counter() - last_chunk_time
+            error_type = type(e).__name__
+            log.error(
+                f"[上游] 流错误 会话={chat_id} 错误类型={error_type} "
+                f"已耗时={elapsed:.3f}s 空闲={idle_time:.3f}s 错误={str(e)[:200]}"
+            )
+            raise
+
+        if buffer:
+            for evt in parse_sse_chunk(buffer):
+                if not first_event_logged:
+                    first_event_logged = True
+                    log.info(
+                        f"[上游] 首个事件耗时 {(time.perf_counter() - started_at):.3f}s 会话={chat_id}"
+                    )
+                yield evt
+
+        elapsed = time.perf_counter() - started_at
+        # 检测异常短回复（通常是上游超时的信号）
+        if has_custom_tools and total_output_chars < 20 and elapsed > 5.0:
+            log.warning(f"[上游] 异常短回复 仅 {total_output_chars} 字符 耗时 {elapsed:.1f}s — 疑似上游超时")
+            raise Exception(f"Upstream timeout suspected: only {total_output_chars} chars in {elapsed:.1f}s")
+
+        log.info(f"[上游] 流结束 会话={chat_id} 总耗时={elapsed:.3f}s 流字节={total_output_chars}")
+
+    async def chat_stream_events_with_retry(
+        self,
+        model: str,
+        content: str,
+        has_custom_tools: bool = False,
+        files: list[dict] | None = None,
+        fixed_account=None,
+        existing_chat_id: str | None = None,
+    ):
+        exclude = set()
+        if fixed_account is not None:
+            acc = fixed_account
+            # 绑定账号路径同样要处理 punish / chat_not_found：
+            # 这两类失败与账号无关（换账号也没用），但都能通过
+            # "作废会话 cookie 或作废 chat_id 后原地重试"救回来。
+            # 之前这里无条件 raise，导致客户端直接看到"模型本轮未生成回复"。
+            last_error: Exception | None = None
+            for attempt in range(max(1, settings.MAX_RETRIES)):
+                update_request_context(upstream_attempt=attempt + 1)
+                chat_id = None
+                try:
+                    log.info(f"[上游] 使用指定账号 账号={acc.email} 模型={model} 第{attempt + 1}次")
+                    chat_id = existing_chat_id or await self.create_chat(acc.token, model)
+                    update_request_context(chat_id=chat_id)
+                    if existing_chat_id:
+                        log.info(f"[上游] 复用会话 会话={chat_id} 账号={acc.email}")
+                    else:
+                        log.info(f"[上游] 创建会话 会话={chat_id} 账号={acc.email}")
+                    yield {"type": "meta", "chat_id": chat_id, "acc": acc}
+                    async for evt in self.stream(acc.token, chat_id, model, content, has_custom_tools, files=files):
+                        yield {"type": "event", "event": evt}
+                    return
+                except Exception as e:
+                    last_error = e
+                    err_msg = str(e).lower()
+                    is_punish = "punish" in err_msg or "x5secdata" in err_msg
+                    is_chat_gone = "chat_not_found" in err_msg
+                    recoverable = (is_punish or is_chat_gone) and attempt + 1 < max(1, settings.MAX_RETRIES)
+                    if not recoverable:
+                        self.account_pool.release(acc)
+                        raise
+                    if is_punish:
+                        invalidate = getattr(self.engine, "invalidate_browser_session", None)
+                        log.warning(
+                            f"[上游] punish 风控（绑定账号）账号={acc.email} "
+                            f"第{attempt + 1}/{settings.MAX_RETRIES}次 — 作废浏览器会话后重试"
+                        )
+                        if invalidate is not None:
+                            try:
+                                await invalidate(reason="punish_challenge")
+                            except Exception as ie:
+                                log.warning(f"[上游] 作废会话失败: {ie}")
+                        await asyncio.sleep(1.0)
+                    else:
+                        log.warning(
+                            f"[上游] 会话失效（绑定账号）账号={acc.email} 会话={chat_id} "
+                            f"第{attempt + 1}/{settings.MAX_RETRIES}次 — 换新会话重试"
+                        )
+                        if self.chat_id_pool is not None and chat_id:
+                            try:
+                                await self.chat_id_pool.invalidate(acc.email, chat_id)
+                            except Exception as ie:
+                                log.warning(f"[上游] 作废失效 chat_id 失败: {ie}")
+                        # 复用的会话已失效，后续必须新建
+                        existing_chat_id = None
+                    continue
+            self.account_pool.release(acc)
+            raise last_error or Exception("fixed account attempts exhausted")
+
+        for attempt in range(settings.MAX_RETRIES):
+            update_request_context(upstream_attempt=attempt + 1)
+            acquire_start = time.perf_counter()
+            acc = await self.account_pool.acquire_wait(timeout=60, exclude=exclude)
+            acquire_elapsed = time.perf_counter() - acquire_start
+            if not acc:
+                raise Exception("No available accounts in pool (all busy or rate limited)")
+
+            try:
+                log.info(f"[上游] 账号已获取 账号={acc.email} 模型={model} 第{attempt + 1}次 获取耗时={acquire_elapsed:.3f}s")
+                create_start = time.perf_counter()
+                chat_id = None
+                chat_id = await self.create_chat(acc.token, model)
+                create_elapsed = time.perf_counter() - create_start
+                update_request_context(chat_id=chat_id)
+                log.info(f"[上游] 创建会话 会话={chat_id} 账号={acc.email} 耗时={create_elapsed:.3f}s")
+                yield {"type": "meta", "chat_id": chat_id, "acc": acc}
+
+                async for evt in self.stream(acc.token, chat_id, model, content, has_custom_tools, files=files):
+                    yield {"type": "event", "event": evt}
+                return
+
+            except Exception as e:
+                err_msg = str(e).lower()
+                is_timeout = (
+                    "timeout" in err_msg
+                    or "timed out" in err_msg
+                    or "readtimeout" in err_msg
+                    or type(e).__name__ in ("ReadTimeout", "TimeoutError", "TimeoutException")
+                )
+                is_waf = "waf_blocked" in err_msg or "waf challenge" in err_msg or "aliyun_waf" in err_msg
+                # 预热池给的 chat_id 已被上游回收：作废它，重试时会新建会话。
+                # 这类失败与账号无关，不要把账号排除掉。
+                if "chat_not_found" in err_msg:
+                    if self.chat_id_pool is not None and chat_id:
+                        try:
+                            await self.chat_id_pool.invalidate(acc.email, chat_id)
+                        except Exception as ie:
+                            log.warning(f"[上游] 作废失效 chat_id 失败: {ie}")
+                    self.account_pool.release(acc)
+                    log.warning(
+                        f"[上游] 会话失效重试 第{attempt + 1}/{settings.MAX_RETRIES}次 账号={acc.email} 会话={chat_id}"
+                    )
+                    if attempt + 1 < settings.MAX_RETRIES:
+                        continue
+                    raise Exception(f"chat_not_found after {settings.MAX_RETRIES} attempts: {e}")
+
+                if is_waf:
+                    # WAF 拦截不是账号问题，是服务端风控。但要区分两种：
+                    # - punish 挑战（x5secdata）：当前浏览器会话 cookie 被标记，
+                    #   换账号无效、换 bx 签名无效，实测唯一有效的是丢掉这套 cookie
+                    #   重新拿会话。所以这里主动作废会话并重试（同一账号即可）。
+                    # - 其他类型（滑块等）：确实需要人工介入，直接抛出。
+                    is_punish = "punish" in err_msg or "x5secdata" in err_msg
+                    invalidate = getattr(self.engine, "invalidate_browser_session", None)
+                    if is_punish and invalidate is not None and attempt + 1 < settings.MAX_RETRIES:
+                        log.warning(
+                            f"[上游] punish 风控 账号={acc.email} 第{attempt + 1}/{settings.MAX_RETRIES}次"
+                            f" — 作废浏览器会话后重试"
+                        )
+                        try:
+                            await invalidate(reason="punish_challenge")
+                        except Exception as ie:
+                            log.warning(f"[上游] 作废会话失败: {ie}")
+                        self.account_pool.release(acc)
+                        await asyncio.sleep(1.0)
+                        continue
+                    log.warning(f"[上游] WAF 拦截 账号={acc.email} 错误={e}")
+                    self.account_pool.release(acc)
+                    raise Exception(f"WAF blocked: Qwen WAF 拦截了本次请求。请设置 BROWSER_HEADED=1 环境变量后重启，在打开的浏览器窗口中手动完成验证码。详情: {e}")
+                elif is_timeout:
+                    log.warning(f"[上游] 超时 第{attempt + 1}/{settings.MAX_RETRIES}次 账号={acc.email} 错误={e}")
+                    exclude.add(acc.email)
+                elif "429" in err_msg or "rate limit" in err_msg or "too many" in err_msg:
+                    self.account_pool.mark_rate_limited(acc)
+                    exclude.add(acc.email)
+                elif "unauthorized" in err_msg or "401" in err_msg or "403" in err_msg:
+                    self.account_pool.mark_invalid(acc)
+                    exclude.add(acc.email)
+                    if "activation" in err_msg or "pending" in err_msg:
+                        acc.activation_pending = True
+                    if self.auth_resolver is not None:
+                        asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
+                else:
+                    exclude.add(acc.email)
+
+                self.account_pool.release(acc)
+                log.warning(
+                    f"[上游] 重试 第{attempt + 1}/{settings.MAX_RETRIES}次 账号={acc.email} 错误={e}"
+                )
+
+        raise Exception(f"All {settings.MAX_RETRIES} attempts failed. Please check upstream accounts.")

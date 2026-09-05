@@ -1,0 +1,13 @@
+[
+  {
+    "email": "test@test.com",
+    "token": "fake_token",
+    "password": "test",
+    "is_valid": true,
+    "last_used": 0,
+    "inflight": 0,
+    "activation_pending": false,
+    "created_at": 1712534400,
+    "rate_limited_until": 0
+  }
+]

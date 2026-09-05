@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+httpx[http2]
+pydantic-settings
+python-dotenv
+python-multipart
+tiktoken
+curl_cffi
+camoufox
+oss2
+playwright

@@ -1,0 +1,32 @@
+services:
+  qwen2api:
+    # 本地构建：工作区改动（nc_slider/browser_launch 等）才会进镜像。
+    # 之前只有 image 没有 build，up 拉起的是远端旧镜像，本地修复全部不生效。
+    build: .
+    image: yujunzhixue/qwen2api:latest
+    container_name: qwen2api
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "7860:7860"
+    volumes:
+      - ./data:/workspace/data
+      - ./logs:/workspace/logs
+      # bx_pool.json 在容器内路径 /workspace/bx_pool.json(由 _prepend_runtime_bx_entry 写入),
+      # 不挂载的话 docker-compose down 之后所有运行时抓的 bx 头会随容器一起没,
+      # 下次 up 看到的还是镜像里 COPY 进去的旧条目。单文件挂载(而非 bind mount 整个目录)
+      # 避免把 backend/、frontend/ 等源码意外挂进容器。
+      - ./bx_pool.json:/workspace/bx_pool.json
+    shm_size: '256m'
+    environment:
+      PYTHONIOENCODING: utf-8
+      PORT: "7860"
+      ENGINE_MODE: "hybrid"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7860/healthz"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
